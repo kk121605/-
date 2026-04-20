@@ -1,0 +1,174 @@
+from abc import ABC, abstractmethod
+
+import numpy as np
+import torch as th
+import torch.distributed as dist
+
+
+def create_named_schedule_sampler(name, diffusion):
+    """
+    Create a ScheduleSampler from a library of pre-defined samplers.
+
+    :param name: the name of the sampler.
+    :param diffusion: the diffusion object to sample for.
+    """
+    if name == "uniform":
+        return UniformSampler(diffusion)
+    elif name == "loss-second-moment":
+        return LossSecondMomentResampler(diffusion)
+    else:
+        raise NotImplementedError(f"unknown schedule sampler: {name}")
+
+
+class ScheduleSampler(ABC):
+    """
+    A distribution over timesteps in the diffusion process, intended to reduce
+    variance of the objective.
+
+    By default, samplers perform unbiased importance sampling, in which the
+    objective's mean is unchanged.
+    However, subclasses may override sample() to change how the resampled
+    terms are reweighted, allowing for actual changes in the objective.
+    """
+
+    @abstractmethod
+    def weights(self):
+        """
+        Get a numpy array of weights, one per diffusion step.
+
+        The weights needn't be normalized, but must be positive.
+        """
+
+    def sample(self, batch_size, device):
+        """
+        Importance-sample timesteps for a batch.
+
+        :param batch_size: the number of timesteps.
+        :param device: the torch device to save to.
+        :return: a tuple (timesteps, weights):
+                 - timesteps: a tensor of timestep indices.
+                 - weights: a tensor of weights to scale the resulting losses.
+        """
+        w = self.weights()
+        p = w / np.sum(w)
+        indices_np = np.random.choice(len(p), size=(batch_size,), p=p)
+        indices = th.from_numpy(indices_np).long().to(device)
+        weights_np = 1 / (len(p) * p[indices_np])
+        weights = th.from_numpy(weights_np).float().to(device)
+        return indices, weights
+
+
+class UniformSampler(ScheduleSampler):
+    """
+      一个实现了均匀采样的调度采样器类。
+      该类继承自 ScheduleSampler，用于为扩散过程中的时间步生成采样权重。
+      """
+    def __init__(self, diffusion):
+        self.diffusion = diffusion  # 保存扩散模型实例。
+        # 创建一个长度为扩散模型时间步数的权重数组，并初始化为 1。
+        # 均匀采样的权重在每个时间步上都是相同的，因此这里全为 1。
+        self._weights = np.ones([diffusion.num_timesteps])
+
+    def weights(self):
+        """
+               返回当前的采样权重。
+               返回值：
+               - self._weights: 一个 numpy 数组，表示扩散过程每个时间步的权重。
+               """
+        return self._weights
+
+
+class LossAwareSampler(ScheduleSampler):    #一个基于损失调整采样权重的调度采样器。
+    def update_with_local_losses(self, local_ts, local_losses):
+        """
+        使用模型的损失更新重新加权方法。
+
+        这个方法从每个分布式进程（rank）收集一个批次的时间步和对应的损失。
+        然后，它同步所有进程的数据以确保所有进程的重新加权结果一致。
+
+        参数：
+        - local_ts: 一个整数 Tensor，表示当前进程的时间步。
+        - local_losses: 一个 1D Tensor，表示当前进程的时间步对应的损失值。
+        """
+        # 初始化一个列表，存储每个进程的批次大小。每个进程的初始大小为 0。
+        batch_sizes = [
+            th.tensor([0], dtype=th.int32, device=local_ts.device)   # 每个元素是一个张量，初始值为 0。
+            for _ in range(dist.get_world_size())   # 为每个进程分配一个张量。
+        ]
+        # 使用分布式操作 `all_gather` 同步所有进程的批次大小。
+        dist.all_gather(
+            batch_sizes,    # 收集结果存储在 batch_sizes 列表中。
+            # 当前进程将自己的批次大小（local_ts 的长度）广播给其他进程。
+            th.tensor([len(local_ts)], dtype=th.int32, device=local_ts.device),
+        )
+
+        # Pad all_gather batches to be the maximum batch size.
+        batch_sizes = [x.item() for x in batch_sizes]   # 将每个张量的值转换为整数。
+        max_bs = max(batch_sizes)   # 找出所有进程中的最大批次大小。
+
+        # 初始化时间步 (`timestep_batches`) 和损失 (`loss_batches`) 的张量列表。
+        # 每个张量长度为 `max_bs`，使用零填充，设备与 local_ts 一致。
+        timestep_batches = [th.zeros(max_bs).to(local_ts) for bs in batch_sizes]
+        # 与时间步张量类似，存储损失值，同样使用零填充。
+        loss_batches = [th.zeros(max_bs).to(local_losses) for bs in batch_sizes]
+        # 使用 `all_gather` 收集所有进程的时间步数据。
+        dist.all_gather(timestep_batches, local_ts) # 将每个进程的 local_ts 广播给其他进程。
+        # 使用 `all_gather` 收集所有进程的损失数据。
+        dist.all_gather(loss_batches, local_losses)  # 同样地，将 local_losses 广播给其他进程。
+        # 从 `timestep_batches` 和 `loss_batches` 中提取实际的时间步和损失值。
+        timesteps = [
+            x.item() for y, bs in zip(timestep_batches, batch_sizes) for x in y[:bs]    # 遍历每个进程的时间步张量，只提取前 `bs` 个有效值（去掉填充的零）。
+        ]
+        losses = [x.item() for y, bs in zip(loss_batches, batch_sizes) for x in y[:bs]] # 遍历每个进程的损失张量，只提取前 `bs` 个有效值（去掉填充的零）。
+        # 调用 `update_with_all_losses` 方法，使用收集到的时间步和损失更新全局权重。
+        self.update_with_all_losses(timesteps, losses)
+
+    @abstractmethod
+    def update_with_all_losses(self, ts, losses):
+        """
+        Update the reweighting using losses from a model.
+
+        Sub-classes should override this method to update the reweighting
+        using losses from the model.
+
+        This method directly updates the reweighting without synchronizing
+        between workers. It is called by update_with_local_losses from all
+        ranks with identical arguments. Thus, it should have deterministic
+        behavior to maintain state across workers.
+
+        :param ts: a list of int timesteps.
+        :param losses: a list of float losses, one per timestep.
+        """
+
+
+class LossSecondMomentResampler(LossAwareSampler):
+    def __init__(self, diffusion, history_per_term=10, uniform_prob=0.001):
+        self.diffusion = diffusion
+        self.history_per_term = history_per_term
+        self.uniform_prob = uniform_prob
+        self._loss_history = np.zeros(
+            [diffusion.num_timesteps, history_per_term], dtype=np.float64
+        )
+        self._loss_counts = np.zeros([diffusion.num_timesteps], dtype=np.int)
+
+    def weights(self):
+        if not self._warmed_up():
+            return np.ones([self.diffusion.num_timesteps], dtype=np.float64)
+        weights = np.sqrt(np.mean(self._loss_history ** 2, axis=-1))
+        weights /= np.sum(weights)
+        weights *= 1 - self.uniform_prob
+        weights += self.uniform_prob / len(weights)
+        return weights
+
+    def update_with_all_losses(self, ts, losses):
+        for t, loss in zip(ts, losses):
+            if self._loss_counts[t] == self.history_per_term:
+                # Shift out the oldest loss term.
+                self._loss_history[t, :-1] = self._loss_history[t, 1:]
+                self._loss_history[t, -1] = loss
+            else:
+                self._loss_history[t, self._loss_counts[t]] = loss
+                self._loss_counts[t] += 1
+
+    def _warmed_up(self):
+        return (self._loss_counts == self.history_per_term).all()
